@@ -1,0 +1,317 @@
+
+layout (std140, set = 1, binding = 0) uniform Local {
+    vec3 worldSunDir; // sun direction in world space
+    float octaves;
+
+    vec4 cloudsColor;
+
+    float lacunarity;
+    float gain;
+    float norm;
+    float clamp1;
+
+    float clamp2;
+    float texture_width;
+    float texture_height;
+    uint  destination_texture;
+};
+
+layout ( set = 1, binding = 1 ) uniform sampler2D skyIrradianceSampler;
+layout ( set = 1, binding = 2 ) uniform sampler2D noiseSampler;
+layout ( set = 1, binding = 3 ) uniform sampler2D transmittanceSampler;
+layout ( set = 1, binding = 4 ) uniform sampler3D inscatterSampler;
+
+vec2 getIrradianceUV(float r, float muS) {
+    float uR = (r - Rg) / (Rt - Rg);
+    float uMuS = (muS + 0.2) / (1.0 + 0.2);
+    return vec2(uMuS, uR);
+}
+
+vec3 irradiance(sampler2D irradianceSampler, float r, float muS) {
+    vec2 uv = getIrradianceUV(r, muS);
+    return texture(irradianceSampler, uv).rgb;
+}
+
+// ----------------------------------------------------------------------------
+// PUBLIC FUNCTIONS
+// ----------------------------------------------------------------------------
+
+#define TRANSMITTANCE_NON_LINEAR
+
+vec2 getTransmittanceUV(float r, float mu) {
+    float uR, uMu;
+#ifdef TRANSMITTANCE_NON_LINEAR
+    uR = sqrt((r - Rg) / (Rt - Rg));
+    uMu = atan((mu + 0.15) / (1.0 + 0.15) * tan(1.5)) / 1.5;
+#else
+    uR = (r - Rg) / (Rt - Rg);
+    uMu = (mu + 0.15) / (1.0 + 0.15);
+#endif
+    return vec2(uMu, uR);
+}
+
+// transmittance(=transparency) of atmosphere for infinite ray (r,mu)
+// (mu=cos(view zenith angle)), intersections with ground ignored
+vec3 transmittance(float r, float mu) {
+    vec2 uv = getTransmittanceUV(r, mu);
+    return texture(transmittanceSampler, uv).rgb;
+}
+
+// transmittance(=transparency) of atmosphere for infinite ray (r,mu)
+// (mu=cos(view zenith angle)), or zero if ray intersects ground
+vec3 transmittanceWithShadow(float r, float mu) {
+    return mu < -sqrt(1.0 - (Rg / r) * (Rg / r)) ? vec3(0.0) : transmittance(r, mu);
+}
+
+// incident sun light at given position (radiance)
+// r=length(x)
+// muS=dot(x,s) / r
+vec3 sunRadiance(float r, float muS) {
+    return transmittanceWithShadow(r, muS) * SUN_INTENSITY;
+}
+
+// incident sky light at given position, integrated over the hemisphere (irradiance)
+// r=length(x)
+// muS=dot(x,s) / r
+vec3 skyIrradiance(float r, float muS) {
+    return irradiance(skyIrradianceSampler, r, muS) * SUN_INTENSITY;
+}
+
+#define INSCATTER_NON_LINEAR
+
+vec4 texture4D(sampler3D table, float r, float mu, float muS, float nu)
+{
+    float H = sqrt(Rt * Rt - Rg * Rg);
+    float rho = sqrt(r * r - Rg * Rg);
+#ifdef INSCATTER_NON_LINEAR
+    float rmu = r * mu;
+    float delta = rmu * rmu - r * r + Rg * Rg;
+    vec4 cst = rmu < 0.0 && delta > 0.0 ? vec4(1.0, 0.0, 0.0, 0.5 - 0.5 / float(RES_MU)) : vec4(-1.0, H * H, H, 0.5 + 0.5 / float(RES_MU));
+    float uR = 0.5 / float(RES_R) + rho / H * (1.0 - 1.0 / float(RES_R));
+    float uMu = cst.w + (rmu * cst.x + sqrt(delta + cst.y)) / (rho + cst.z) * (0.5 - 1.0 / float(RES_MU));
+    // paper formula
+    //float uMuS = 0.5 / float(RES_MU_S) + max((1.0 - exp(-3.0 * muS - 0.6)) / (1.0 - exp(-3.6)), 0.0) * (1.0 - 1.0 / float(RES_MU_S));
+    // better formula
+    float uMuS = 0.5 / float(RES_MU_S) + (atan(max(muS, -0.1975) * tan(1.26 * 1.1)) / 1.1 + (1.0 - 0.26)) * 0.5 * (1.0 - 1.0 / float(RES_MU_S));
+#else
+    float uR = 0.5 / float(RES_R) + rho / H * (1.0 - 1.0 / float(RES_R));
+    float uMu = 0.5 / float(RES_MU) + (mu + 1.0) / 2.0 * (1.0 - 1.0 / float(RES_MU));
+    float uMuS = 0.5 / float(RES_MU_S) + max(muS + 0.2, 0.0) / 1.2 * (1.0 - 1.0 / float(RES_MU_S));
+#endif
+    float lerp = (nu + 1.0) / 2.0 * (float(RES_NU) - 1.0);
+    float uNu = floor(lerp);
+    lerp = lerp - uNu;
+    return texture(table, vec3((uNu + uMuS) / float(RES_NU), uMu, uR)) * (1.0 - lerp) +
+           texture(table, vec3((uNu + uMuS + 1.0) / float(RES_NU), uMu, uR)) * lerp;
+}
+
+// Rayleigh phase function
+float phaseFunctionR(float mu) {
+    return (3.0 / (16.0 * M_PI)) * (1.0 + mu * mu);
+}
+
+// Mie phase function
+float phaseFunctionM(float mu) {
+    return 1.5 * 1.0 / (4.0 * M_PI) * (1.0 - mieG*mieG) * pow(1.0 + (mieG*mieG) - 2.0*mieG*mu, -3.0/2.0) * (1.0 + mu * mu) / (2.0 + mieG*mieG);
+}
+
+// approximated single Mie scattering (cf. approximate Cm in paragraph "Angular precision")
+vec3 getMie(vec4 rayMie) { // rayMie.rgb=C*, rayMie.w=Cm,r
+    return rayMie.rgb * rayMie.w / max(rayMie.r, 1e-4) * (betaR.r / betaR);
+}
+
+// scattered sunlight between two points
+// camera=observer
+// viewdir=unit vector towards observed point
+// sundir=unit vector towards the sun
+// return scattered light and extinction coefficient
+vec3 skyRadiance(vec3 camera, vec3 viewdir, vec3 sundir, out vec3 extinction)
+{
+    vec3 result;
+    float r = length(camera);
+    float rMu = dot(camera, viewdir);
+    float mu = rMu / r;
+    float r0 = r;
+    float mu0 = mu;
+
+    float deltaSq = sqrt(rMu * rMu - r * r + Rt*Rt);
+    float din = max(-rMu - deltaSq, 0.0);
+    if (din > 0.0) {
+        camera += din * viewdir;
+        rMu += din;
+        mu = rMu / Rt;
+        r = Rt;
+    }
+
+    if (r <= Rt) {
+        float nu = dot(viewdir, sundir);
+        float muS = dot(camera, sundir) / r;
+
+        vec4 inScatter = texture4D(inscatterSampler, r, rMu / r, muS, nu);
+        extinction = transmittance(r, mu);
+
+        vec3 inScatterM = getMie(inScatter);
+        float phase = phaseFunctionR(nu);
+        float phaseM = phaseFunctionM(nu);
+        result = inScatter.rgb * phase + inScatterM * phaseM;
+    } else {
+        result = vec3(0.0);
+        extinction = vec3(1.0);
+    }
+
+    return result * SUN_INTENSITY;
+}
+
+// scattered sunlight between two points
+// camera=observer
+// point=point on the ground
+// sundir=unit vector towards the sun
+// return scattered light and extinction coefficient
+vec3 inScattering(vec3 camera, vec3 point, vec3 sundir, out vec3 extinction) {
+    vec3 result;
+    vec3 viewdir = point - camera;
+    float d = length(viewdir);
+    viewdir = viewdir / d;
+    float r = length(camera);
+    float rMu = dot(camera, viewdir);
+    float mu = rMu / r;
+    float r0 = r;
+    float mu0 = mu;
+
+    float deltaSq = sqrt(rMu * rMu - r * r + Rt*Rt);
+    float din = max(-rMu - deltaSq, 0.0);
+    if (din > 0.0) {
+        camera += din * viewdir;
+        rMu += din;
+        mu = rMu / Rt;
+        r = Rt;
+        d -= din;
+    }
+
+    if (r <= Rt) {
+        float nu = dot(viewdir, sundir);
+        float muS = dot(camera, sundir) / r;
+
+        vec4 inScatter;
+
+        if (r < Rg + 600.0) {
+            // avoids imprecision problems in aerial perspective near ground
+            float f = (Rg + 600.0) / r;
+            r = r * f;
+            rMu = rMu * f;
+            point = point * f;
+        }
+
+        float r1 = length(point);
+        float rMu1 = dot(point, viewdir);
+        float mu1 = rMu1 / r1;
+        float muS1 = dot(point, sundir) / r1;
+
+        if (mu > 0.0) {
+            extinction = min(transmittance(r, mu) / transmittance(r1, mu1), 1.0);
+        } else {
+            extinction = min(transmittance(r1, -mu1) / transmittance(r, -mu), 1.0);
+        }
+
+        vec4 inScatter0 = texture4D(inscatterSampler, r, mu, muS, nu);
+        vec4 inScatter1 = texture4D(inscatterSampler, r1, mu1, muS1, nu);
+        inScatter = max(inScatter0 - inScatter1 * extinction.rgbr, 0.0);
+
+        // avoids imprecision problems in Mie scattering when sun is below horizon
+        inScatter.w *= smoothstep(0.00, 0.02, muS);
+
+        vec3 inScatterM = getMie(inScatter);
+        float phase = phaseFunctionR(nu);
+        float phaseM = phaseFunctionM(nu);
+        result = inScatter.rgb * phase + inScatterM * phaseM;
+    } else {
+        result = vec3(0.0);
+        extinction = vec3(1.0);
+    }
+
+    return result * SUN_INTENSITY;
+}
+
+void sunRadianceAndSkyIrradiance(vec3 worldP, vec3 worldS, out vec3 sunL, out vec3 skyE)
+{
+    vec3 worldV = normalize(worldP); // vertical vector
+    float r = length(worldP);
+    float muS = dot(worldV, worldS);
+    sunL = sunRadiance(r, muS);
+    skyE = skyIrradiance(r, muS);
+}
+
+vec4 cloudColor(vec3 worldP, vec3 worldCamera, vec3 worldSunDir) {
+    const float a = 23.0 / 180.0 * M_PI;
+    mat2 m = mat2(cos(a), sin(a), -sin(a), cos(a));
+
+    vec2 st = worldP.xy / 1000000.0;
+    float g = 1.0;
+    float r = 0.0;
+    for (float i = 0.0; i < octaves; i += 1.0) {
+        r -= g * (2.0 * texture(noiseSampler, st).r - 1.0);
+        st = (m * st) * lacunarity;
+        g *= gain;
+    }
+
+    float v = clamp((r * norm - clamp1) / (clamp2 - clamp1), 0.0, 1.0);
+    float t = clamp((r * norm * 3.0 - clamp1) / (clamp2 - clamp1), 0.0, 1.0);
+
+    vec3 PP = worldP + earthPos;
+
+    vec3 Lsun;
+    vec3 Esky;
+    vec3 extinction;
+    sunRadianceAndSkyIrradiance(PP, worldSunDir, Lsun, Esky);
+
+	vec3 cloudL = v * (Lsun * max(worldSunDir.z, 0.0) + Esky / 10.0) / M_PI;
+
+    vec3 inscatter = inScattering(worldCamera + earthPos, PP, worldSunDir, extinction);
+    cloudL = cloudL * extinction + inscatter;
+
+    return vec4(cloudL, t) * cloudsColor;
+}
+
+vec4 cloudColorV(vec3 worldCamera, vec3 V, vec3 worldSunDir) {
+    vec3 P = worldCamera + V * (3000.0 - worldCamera.z) / V.z;
+    return cloudColor(P, worldCamera, worldSunDir);
+}
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    // NOTE(marco): original code uses a screen space vertex shader, which goes from [-1, 1]
+    vec2 u = (vec2(gl_GlobalInvocationID.xy) ) / vec2(texture_width, texture_height);
+    u = u * 2 - 1;
+    u *= 1.1;
+    float l = dot(u, u);
+    vec4 result = vec4(0.0);
+
+    if (l <= 1.02) {
+        if (l > 1.0) {
+            u = u / l;
+            l = 1.0 / l;
+        }
+
+        // inverse stereographic projection,
+        // from skymap coordinates to world space directions
+        vec3 r = vec3(2.0 * u, 1.0 - l) / (1.0 + l);
+
+        vec3 extinction;
+        result.rgb = skyRadiance(earthPos, r, worldSunDir, extinction);
+
+#ifdef CLOUDS
+        vec4 cloudL = cloudColorV(vec3(0.0), r, worldSunDir);
+        result.rgb = cloudL.rgb * cloudL.a + result.rgb * (1.0 - cloudL.a);
+#endif
+    } else {
+        // below horizon:
+        // use average fresnel * average sky radiance
+        // to simulate multiple reflections on waves
+
+        const float avgFresnel = 0.17;
+        result.rgb = skyIrradiance(earthPos.z, worldSunDir.z) / M_PI * avgFresnel;
+    }
+
+    imageStore( global_images_2d[destination_texture], ivec2( gl_GlobalInvocationID.xy ), result );
+}

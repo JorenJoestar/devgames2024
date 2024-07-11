@@ -1,0 +1,262 @@
+
+
+layout (std140, set=1, binding=0)
+uniform Local{
+    AtmosphereParameters atmosphere_params;
+};
+
+
+shared vec3 MultiScatAs1SharedMem[64];
+shared vec3 LSharedMem[64];
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 64) in;
+
+void GroupMemoryBarrierWithGroupSync() {
+    groupMemoryBarrier();
+    memoryBarrierShared();
+    memoryBarrierImage();
+    memoryBarrier();
+    barrier();
+}
+
+
+// Utility methods for barriers
+void global_shader_barrier() {
+    memoryBarrierImage();
+    memoryBarrierBuffer();
+    memoryBarrierShared();
+    memoryBarrier();
+    barrier();
+}
+
+void group_barrier() {
+    groupMemoryBarrier();
+    memoryBarrierShared();
+    barrier();
+}
+
+void main() {
+
+    ivec3 pos = ivec3(gl_GlobalInvocationID.xyz);
+
+    // if (pos.z == 0) {
+    //     for (uint i = 0; i < 64; ++i) {
+    //         MultiScatAs1SharedMem[i] = vec3(0,0,0);
+    //         LSharedMem[i] = vec3(0,0,0);
+    //     }
+    // }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const float MultiScatteringLUTRes = 32.0f;
+    vec2 uv = (pos.xy + vec2(0.5)) / vec2(MultiScatteringLUTRes, MultiScatteringLUTRes);
+
+    uv = vec2(fromSubUvsToUnit(uv.x, MultiScatteringLUTRes), fromSubUvsToUnit(uv.y, MultiScatteringLUTRes));
+
+    float cosSunZenithAngle = uv.x * 2.0 - 1.0;
+    vec3 sunDir = vec3(0.0, cosSunZenithAngle, sqrt(saturate(1.0 - cosSunZenithAngle * cosSunZenithAngle)));
+    // We adjust again viewHeight according to PLANET_RADIUS_OFFSET to be in a valid range.
+    float viewHeight = atmosphere_params.bottom_radius + saturate(uv.y + PLANET_RADIUS_OFFSET) * (atmosphere_params.top_radius - atmosphere_params.bottom_radius - PLANET_RADIUS_OFFSET);
+
+    vec3 WorldPos = vec3(0.0f, viewHeight, 0.0f);
+    vec3 WorldDir = vec3(0.0f, 0.0f, 1.0f);
+
+
+    const bool ground = true;
+    const float SampleCountIni = 20;// a minimum set of step is required for accuracy unfortunately
+    const float DepthBufferValue = -1.0;
+    const bool VariableSampleCount = false;
+    const bool MieRayPhase = false;
+
+    const float SphereSolidAngle = 4.0 * PI;
+    const float IsotropicPhase = 1.0 / SphereSolidAngle;
+
+        // Reference. Since there are many sample, it requires MULTI_SCATTERING_POWER_SERIE to be true for accuracy and to avoid divergences (see declaration for explanations)
+#define SQRTSAMPLECOUNT 8
+    const float sqrtSample = float(SQRTSAMPLECOUNT);
+    float i = 0.5f + float(pos.z / SQRTSAMPLECOUNT);
+    float j = 0.5f + float(pos.z - float((pos.z / SQRTSAMPLECOUNT)*SQRTSAMPLECOUNT));
+    {
+        float randA = i / sqrtSample;
+        float randB = j / sqrtSample;
+        float theta = 2.0f * PI * randA;
+        float phi = acos(1.0f - 2.0f * randB);  // uniform distribution https://mathworld.wolfram.com/SpherePointPicking.html
+        //phi = PI * randB;                     // bad non uniform
+        float cosPhi = cos(phi);
+        float sinPhi = sin(phi);
+        float cosTheta = cos(theta);
+        float sinTheta = sin(theta);
+        WorldDir.x = cosTheta * sinPhi;
+        WorldDir.y = sinTheta * sinPhi;
+        WorldDir.z = cosPhi;
+
+        uint transmittance_lut = atmosphere_params.transmittance_lut_texture_index;
+
+#if 0
+        SingleScatteringResult r0 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.70710678118f, 0.0f, 0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r1 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(-0.70710678118f, 0.0f, 0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r2 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.0f, 0.70710678118f, 0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r3 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.0f, -0.70710678118f, 0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r4 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.70710678118f, 0.0f, -0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r5 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(-0.70710678118f, 0.0f, -0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r6 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.0f, 0.70710678118f, -0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        SingleScatteringResult r7 = IntegrateScatteredLuminance(pos.xy, WorldPos, vec3(0.0f, -0.70710678118f, -0.70710678118f), sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+
+        // Integral of in-scattered Luminance (Lumen/(m2.sr)) over the sphere gives illuminance (Lumen/m2). 
+        // This is done with equal importance for each samples over the sphere. 
+        vec3 IntegratedIlluminance = (SphereSolidAngle / 8.0f) * (r0.L + r1.L + r2.L + r3.L + r4.L + r5.L + r6.L + r7.L);
+
+        // MultiScatAs1 represents the contribution of a uniform environment light over a sphere of luminance 1 and assuming an isotropic phase function 
+        vec3 MultiScatAs1 = (1.0f / 8.0f)*(r0.MultiScatAs1 + r1.MultiScatAs1 + r2.MultiScatAs1 + r3.MultiScatAs1 + r4.MultiScatAs1 + r5.MultiScatAs1 + r6.MultiScatAs1 + r7.MultiScatAs1);
+
+        // Compute the InScatteredLuminance (Lumen/(m2.sr)) assuming a uniform IntegratedIlluminance, isotropic phase function (1.0/sr)
+        // and the fact that this illumiance would be used for each path/raymarch samples of each path
+        vec3 InScatteredLuminance = IntegratedIlluminance * IsotropicPhase;
+
+        // For a serie, sum_{n=0}^{n=+inf} = 1 + r + r^2 + r^3 + ... + r^n = 1 / (1.0 - r), see https://en.wikipedia.org/wiki/Geometric_series  
+        const float3 R = MultiScatAs1;
+        const float3 SumOfAllMultiScatteringEventsContribution = 1.0f / (1.0f - R);
+        float3 L = InScatteredLuminance * SumOfAllMultiScatteringEventsContribution;
+
+        // TODO: expose
+        float MultipleScatteringFactor = 1.0f;
+
+        uint destination_texture = atmosphere_params.multiscattering_texture_index;
+        imageStore( global_images_2d[destination_texture], pos.xy, vec4(MultipleScatteringFactor * L, 1) );
+#endif // 0
+
+        SingleScatteringResult r0 = IntegrateScatteredLuminance(pos.xy, WorldPos, WorldDir, sunDir, atmosphere_params, ground, 
+            SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+            T_RAY_MAX, vec2(32, 32), transmittance_lut);
+        MultiScatAs1SharedMem[pos.z] = r0.MultiScatAs1 * SphereSolidAngle / (sqrtSample * sqrtSample);
+        LSharedMem[pos.z] = r0.L * SphereSolidAngle / (sqrtSample * sqrtSample);
+
+    }
+#undef SQRTSAMPLECOUNT
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // 64 to 32
+    // if (pos.z < 32)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 32];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 32];
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+
+    // // 32 to 16
+    // if (pos.z < 16)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 16];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 16];
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+
+    // // 16 to 8 (16 is thread group min hardware size with intel, no sync required from there)
+    // if (pos.z < 8)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 8];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 8];
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+    // if (pos.z < 4)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 4];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 4];
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+    // if (pos.z < 2)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 2];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 2];
+    // }
+    // GroupMemoryBarrierWithGroupSync();
+    // if (pos.z < 1)
+    // {
+    //     MultiScatAs1SharedMem[pos.z] += MultiScatAs1SharedMem[pos.z + 1];
+    //     LSharedMem[pos.z] += LSharedMem[pos.z + 1];
+    // }
+    GroupMemoryBarrierWithGroupSync();
+
+    memoryBarrier();
+    barrier();
+
+    if (pos.z == 0) {
+
+        for (uint i = 0; i < 32; ++i) {
+            MultiScatAs1SharedMem[i] += MultiScatAs1SharedMem[i + 32];
+            LSharedMem[i] += LSharedMem[i + 32];
+        }
+
+        for (uint i = 0; i < 16; ++i) {
+            MultiScatAs1SharedMem[i] += MultiScatAs1SharedMem[i + 16];
+            LSharedMem[i] += LSharedMem[i + 16];
+        }
+
+        for (uint i = 0; i < 8; ++i) {
+            MultiScatAs1SharedMem[i] += MultiScatAs1SharedMem[i + 8];
+            LSharedMem[i] += LSharedMem[i + 8];
+        }
+
+        for (uint i = 0; i < 4; ++i) {
+            MultiScatAs1SharedMem[i] += MultiScatAs1SharedMem[i + 4];
+            LSharedMem[i] += LSharedMem[i + 4];
+        }
+
+        for (uint i = 0; i < 2; ++i) {
+            MultiScatAs1SharedMem[i] += MultiScatAs1SharedMem[i + 2];
+            LSharedMem[i] += LSharedMem[i + 2];
+        }
+
+        MultiScatAs1SharedMem[0] += MultiScatAs1SharedMem[1];
+        LSharedMem[0] += LSharedMem[1];
+
+        vec3 MultiScatAs1         = MultiScatAs1SharedMem[0] * IsotropicPhase;    // Equation 7 f_ms
+        vec3 InScatteredLuminance = LSharedMem[0] * IsotropicPhase;               // Equation 5 L_2ndOrder
+
+        // MultiScatAs1 represents the amount of luminance scattered as if the integral of scattered luminance over the sphere would be 1.
+        //  - 1st order of scattering: one can ray-march a straight path as usual over the sphere. That is InScatteredLuminance.
+        //  - 2nd order of scattering: the inscattered luminance is InScatteredLuminance at each of samples of fist order integration. Assuming a uniform phase function that is represented by MultiScatAs1,
+        //  - 3nd order of scattering: the inscattered luminance is (InScatteredLuminance * MultiScatAs1 * MultiScatAs1)
+        //  - etc.
+    // #if MULTI_SCATTERING_POWER_SERIE==0
+    //     vec3 MultiScatAs1SQR = MultiScatAs1 * MultiScatAs1;
+    //     vec3 L = InScatteredLuminance * (1.0 + MultiScatAs1 + MultiScatAs1SQR + MultiScatAs1 * MultiScatAs1SQR + MultiScatAs1SQR * MultiScatAs1SQR);
+    // #else
+        // For a serie, sum_{n=0}^{n=+inf} = 1 + r + r^2 + r^3 + ... + r^n = 1 / (1.0 - r), see https://en.wikipedia.org/wiki/Geometric_series 
+        const vec3 r = MultiScatAs1;
+        const vec3 SumOfAllMultiScatteringEventsContribution = 1.0f / (1.0 - r);
+        vec3 L = InScatteredLuminance * SumOfAllMultiScatteringEventsContribution;// Equation 10 Psi_ms
+    //#endif
+
+        // TODO: expose
+        float MultipleScatteringFactor = 1.0f;
+
+        uint destination_texture = atmosphere_params.multiscattering_texture_index;
+        imageStore( global_images_2d[destination_texture], pos.xy, vec4(MultipleScatteringFactor * L, 1) ); 
+    }
+   
+}

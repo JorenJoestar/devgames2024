@@ -1,0 +1,126 @@
+// shader atmospheric_scattering {
+
+// layout {
+//     list LocalCompute {
+//         cbuffer AtmosphereParameters locals;
+//         texture2Drw rgba16 destination;
+//     }
+
+//     list SkyLut {
+//         cbuffer AtmosphereParameters locals;
+//         texture2D transmittance_lut;
+//     }
+
+
+//     #pragma include "Platform.h"
+    
+//     #if defined VERTEX
+
+//     layout (location = 0) out vec4 vTexCoord;
+
+//     void main() {
+
+//         vTexCoord.xy = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+//         vTexCoord.zw = vTexCoord.xy;
+//         gl_Position = vec4(vTexCoord.xy * 2.0f - 1.0f, 0.0f, 1.0f);
+//         gl_Position.y = -gl_Position.y;
+//     }
+
+//     #endif
+
+//     #if defined FRAGMENT
+
+
+// #pragma include "definitions.glsl"
+// #pragma include "functions.glsl"
+// #pragma include "sky_common.h"
+
+layout (std140, set= 1, binding=0)
+uniform Local{
+    AtmosphereParameters atmosphere_params;
+};
+
+
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+void main() {
+
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (pos + vec2(0.5)) / vec2(192.0, 108.0);
+
+    float raw_depth = 1;
+    vec4 H = vec4( uv.x * 2 - 1, uv.y * -2 + 1, raw_depth * 2 - 1, 1 );
+    vec4 HViewPos = atmosphere_params.inverse_projection * H;
+    vec3 WorldDir = normalize(mat3(atmosphere_params.inverse_view) * (HViewPos.xyz / HViewPos.w)).xyz;
+    vec3 WorldPos = atmosphere_params.camera_position + float3(0, atmosphere_params.bottom_radius, 0);
+    WorldPos.y = max(atmosphere_params.bottom_radius + 0.001f, WorldPos.y);
+
+    vec3 world_direction;
+    vec3 earth_position = earth_position_from_uv_depth( uv.xy, 1, atmosphere_params, world_direction );
+
+    // NEW
+    //world_direction = WorldDir;
+    //earth_position = WorldPos;
+
+    // GS: try to avoid blackness when very low on the grond.
+    float viewHeight = max(length(earth_position), atmosphere_params.bottom_radius + 0.5);
+
+    float viewZenithCosAngle;
+    float lightViewCosAngle;
+    UvToSkyViewLutParams(atmosphere_params, viewZenithCosAngle, lightViewCosAngle, viewHeight, uv.xy);
+
+    vec3 SunDir;
+    {
+        vec3 UpVector = earth_position / viewHeight;
+        float sunZenithCosAngle = dot(UpVector, atmosphere_params.sun_direction);
+        SunDir = normalize(vec3(sqrt(1.0 - sunZenithCosAngle * sunZenithCosAngle), sunZenithCosAngle, 0.0));
+    }
+
+    float viewZenithSinAngle = sqrt(1 - viewZenithCosAngle * viewZenithCosAngle);
+    world_direction = vec3(
+        viewZenithSinAngle * lightViewCosAngle,
+        viewZenithCosAngle,
+        viewZenithSinAngle * sqrt(1.0 - lightViewCosAngle * lightViewCosAngle));
+
+    // NEW
+    //UvToSkyViewLutParams2(atmosphere_params, world_direction, viewHeight, uv);
+    //world_direction = world_direction.xzy;
+
+    earth_position = vec3(0.0f, viewHeight, 0.0f);
+
+    vec4 out_color = vec4(0);
+
+    // // Move to top atmospehre
+    if (!MoveToTopAtmosphere(earth_position, world_direction, atmosphere_params.top_radius))
+    {
+        // Ray is not intersecting the atmosphere
+        out_color = vec4(0, 0, 0, 1);
+    }
+    else {
+
+        const bool ground = false;
+        const float SampleCountIni = 30;
+        const float DepthBufferValue = -1.0;
+        const bool VariableSampleCount = true;
+        const bool MieRayPhase = true;
+        uint transmittance_lut = atmosphere_params.transmittance_lut_texture_index;
+        SingleScatteringResult ss = IntegrateScatteredLuminance(pos.xy, earth_position, world_direction, SunDir, atmosphere_params,
+                                                                ground, SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase,
+                                                                T_RAY_MAX, vec2(192.f, 108.f), transmittance_lut);
+
+        vec3 L = ss.L;
+
+        out_color = vec4(L, 1);
+    }
+
+    //
+    uint destination_texture = atmosphere_params.sky_view_lut_texture_index;
+    imageStore(global_images_2d[destination_texture], pos, out_color);
+}
+
+// pass sky_lut {
+//     resources = SkyLut
+//     vertex = sky_lut
+//     fragment = sky_lut
+//     render_states = main
+// }

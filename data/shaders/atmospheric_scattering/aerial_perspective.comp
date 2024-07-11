@@ -1,0 +1,177 @@
+
+// list AerialPerspective {
+//     cbuffer AtmosphereParameters locals;
+//     texture2D transmittance_lut;
+//     texture3Drw rgba16 destination;
+//     texture2Drw rgba16 debug;
+
+
+// pass aerial_perspective {
+//     resources = AerialPerspective
+//     compute = aerial_perspective
+//     dispatch = 8, 8, 1
+
+
+layout (std140, set=1, binding=0)
+uniform Local{
+    AtmosphereParameters atmosphere_params;
+};
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+
+    ivec3 pos = ivec3(gl_GlobalInvocationID.xyz);
+
+    vec3 SunDir = atmosphere_params.sun_direction;
+    vec3 SunLuminance = vec3(0.0);
+
+    float Slice = ((float(pos.z) + 0.5f) / AP_SLICE_COUNT);
+    Slice *= Slice; // squared distribution
+    Slice *= AP_SLICE_COUNT;
+
+    vec3 WorldDir;
+    vec3 WorldPos = earth_position_from_uv_depth((pos.xy + vec2(0.5)) / AP_TEXTURE_SIZE, 1, atmosphere_params, WorldDir);
+    float viewHeight;
+
+    // New
+    vec2 uv = (pos.xy + vec2(0.5)) / vec2(32, 32);
+    float raw_depth = 0.5;
+    vec4 H = vec4( uv.x * 2 - 1, uv.y * -2 + 1, raw_depth, 1);// * 2 - 1, 1 );
+    vec4 HViewPos = atmosphere_params.inverse_projection * H;
+    WorldDir = normalize(mat3(atmosphere_params.inverse_view) * (HViewPos.xyz / HViewPos.w)).xyz;
+
+    //WorldPos = atmosphere_params.camera_position + float3(0, atmosphere_params.bottom_radius, 0);
+    //WorldPos.y = max(atmosphere_params.bottom_radius + 0.01f, WorldPos.y);
+    //WorldPos = vec3(0, atmosphere_params.bottom_radius + 0.01f, 0);
+
+    float AerialPerspectiveStartDepthKm = 0;
+    // Compute position from froxel information
+    float tMax = AerialPerspectiveSliceToDepth(Slice);
+    vec3 newWorldPos = WorldPos + tMax * WorldDir;
+
+    // Updated code from UE5 SkyAtmosphere.usf
+    // If the voxel is under the ground, make sure to offset it out on the ground.
+    viewHeight = length(newWorldPos);
+
+// UE5_CODE
+//#define AAA
+#if defined (AAA)
+    // Check if the voxel is under the horizon.
+    const bool UnderGround = viewHeight < atmosphere_params.bottom_radius + PLANET_RADIUS_OFFSET;
+
+    vec3 CamPos = WorldPos;
+    vec3 VoxelWorldPos = newWorldPos;
+
+    // Check if the voxel is beind the planet (to next check for below the horizon case)
+    vec3 CameraToVoxel = VoxelWorldPos - CamPos;
+    float CameraToVoxelLen = length(CameraToVoxel);
+    vec3 CameraToVoxelDir = CameraToVoxel / CameraToVoxelLen;
+    float PlanetNearT = raySphereIntersectNearest(CamPos, CameraToVoxelDir, vec3(0, 0, 0), atmosphere_params.bottom_radius);
+    bool BelowHorizon = PlanetNearT > 0.0f && CameraToVoxelLen > PlanetNearT;
+
+    if (BelowHorizon || UnderGround)
+    {
+        CamPos += normalize(CamPos) * 0.02f;    // TODO: investigate why we need this workaround. Without it, we get some bad color and flickering on the ground only (floating point issue with sphere intersection code?).
+
+        vec3 VoxelWorldPosNorm = normalize(VoxelWorldPos);
+        vec3 CamProjOnGround = normalize(CamPos) * atmosphere_params.bottom_radius;
+        vec3 VoxProjOnGround = VoxelWorldPosNorm * atmosphere_params.bottom_radius;
+        vec3 VoxelGroundToRayStart = CamPos - VoxProjOnGround;
+        if (BelowHorizon && dot(normalize(VoxelGroundToRayStart), VoxelWorldPosNorm) < 0.0001f)
+        {
+            // We are behind the sphere and the sphere normal is pointing away from V: we are below the horizon.
+            vec3 MiddlePoint = 0.5f * (CamProjOnGround + VoxProjOnGround);
+            float MiddlePointHeight = length(MiddlePoint);
+
+            // Compute the new position to evaluate and store the value in the voxel.
+            // the position is the oposite side of the horizon point from the view point,
+            // The offset of 1.001f is needed to get matching colors and for the ray to not hit the earth again later due to floating point accuracy
+            vec3 MiddlePointOnGround = normalize(MiddlePoint) * atmosphere_params.bottom_radius;// *1.001f;
+            VoxelWorldPos = CamPos + 2.0f * (MiddlePointOnGround - CamPos);
+
+            //CameraAerialPerspectiveVolumeUAV[ThreadId] = float4(1, 0, 0, 0);
+            //return; // debug
+        }
+        else if (UnderGround)
+        {
+            //No obstruction from the planet, so use the point on the ground
+            VoxelWorldPos = normalize(VoxelWorldPos) * (atmosphere_params.bottom_radius);
+            //VoxelWorldPos = CamPos + CameraToVoxelDir * PlanetNearT;      // better match but gives visual artefact as visible voxels on a simple plane at altitude 0
+
+            //CameraAerialPerspectiveVolumeUAV[ThreadId] = float4(0, 1, 0, 0);
+            //return; // debug
+        }
+         
+        WorldDir = normalize(VoxelWorldPos - CamPos);
+        newWorldPos = CamPos + AerialPerspectiveStartDepthKm * WorldDir; // Offset according to start depth
+        tMax = length(VoxelWorldPos - newWorldPos);
+    }
+
+#else
+
+    if (viewHeight <= (atmosphere_params.bottom_radius + PLANET_RADIUS_OFFSET))
+    {
+        // Apply a position offset to make sure no artefact are visible close to the earth boundaries for large voxel.
+        newWorldPos = normalize(newWorldPos) * (atmosphere_params.bottom_radius + PLANET_RADIUS_OFFSET + 0.001f);
+        WorldDir = normalize(newWorldPos - WorldPos);
+        tMax = length(newWorldPos - WorldPos);
+    }
+#endif // UE5_CODE
+
+    float tMaxMax = tMax;
+
+    // Move ray marching start up to top atmosphere.
+    viewHeight = length(WorldPos);
+    bool ray_inside = true;
+
+    if (viewHeight >= atmosphere_params.top_radius)
+    {
+        vec3 prevWorlPos = WorldPos;
+        if (!MoveToTopAtmosphere(WorldPos, WorldDir, atmosphere_params.top_radius))
+        {
+            // Ray is not intersecting the atmosphere
+            //return float4(0.0, 0.0, 0.0, 1.0);
+            ray_inside = false;
+        }
+        float LengthToAtmosphere = length(prevWorlPos - WorldPos);
+        if (tMaxMax < LengthToAtmosphere)
+        {
+            // tMaxMax for this voxel is not within earth atmosphere
+            //return float4(0.0, 0.0, 0.0, 1.0);
+            ray_inside = false;
+        }
+        // Now world position has been moved to the atmosphere boundary: we need to reduce tMaxMax accordingly. 
+        tMaxMax = max(0.0, tMaxMax - LengthToAtmosphere);
+    }
+
+    vec4 color = vec4(0, 0, 0, 1);
+
+    if ( ray_inside ) {
+        const bool ground = false;
+        const float SampleCountIni = max(1.0, float(pos.z + 1.0) * 2.0f);
+        const float DepthBufferValue = -1.0;
+        const bool VariableSampleCount = false;
+        const bool MieRayPhase = true;
+        uint transmittance_lut = atmosphere_params.transmittance_lut_texture_index;
+        SingleScatteringResult ss = IntegrateScatteredLuminance(pos.xy, WorldPos, WorldDir, SunDir, atmosphere_params, ground, 
+                                    SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase, tMaxMax,
+                                    vec2(AP_TEXTURE_SIZE, AP_TEXTURE_SIZE), transmittance_lut);
+        const float Transmittance = dot(ss.Transmittance, vec3(1.0 / 3.0));
+        color = vec4(ss.L, 1.0f - Transmittance);
+    }
+
+    //color.xyz = HViewPos.xyz / HViewPos.w;
+    //color.xyz = vec3(0,0,0.1);
+    
+    uint destination_texture = atmosphere_params.aerial_perspective_texture_index;
+    imageStore( global_images_3d[destination_texture], pos, color );
+    
+    if ( pos.z == atmosphere_params.aerial_perspective_debug_slice ) {
+        destination_texture = atmosphere_params.aerial_perspective_debug_texture_index;
+
+        color.rgb *= 10;
+        //color.rgb = WorldPos;
+        imageStore( global_images_2d[destination_texture], pos.xy, vec4(color.rgb, 1) );
+    }    
+}

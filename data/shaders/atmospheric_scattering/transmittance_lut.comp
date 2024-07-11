@@ -1,0 +1,71 @@
+
+//list LocalCompute {
+//cbuffer AtmosphereParameters locals;
+//texture2Drw rgba16 destination;
+//}
+
+
+//#pragma include "Platform.h"
+//#pragma include "definitions.glsl"
+//#pragma include "functions.glsl"
+//#pragma include "sky_common.h"
+
+layout (std140, set = 1, binding=0)
+uniform Local{
+    AtmosphereParameters atmosphere_params;
+};
+
+//layout(rgba16f, binding=1) writeonly uniform image2D destination_texture;
+
+layout (local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+void main() {
+
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    // TODO: REDO.
+    //vec3 transmittance = ComputeTransmittanceToTopAtmosphereBoundaryTexture(atmosphere_params, pos);
+    //imageStore(destination_texture, pos, vec4(transmittance, 1));
+
+    float view_height;
+    float view_zenith_cos_angle;
+    vec2 uv = (pos + vec2(0.5)) / vec2(TRANSMITTANCE_TEXTURE_WIDTH * 1.0f, TRANSMITTANCE_TEXTURE_HEIGHT * 1.0f);
+
+    UvToLutTransmittanceParams(atmosphere_params, view_height, view_zenith_cos_angle, uv);
+
+    //  A few extra needed constants
+    vec3 world_position = vec3(0.0f, view_height, 0.0f);
+    vec3 world_direction = vec3(0.0f, view_zenith_cos_angle, sqrt(1.0 - view_zenith_cos_angle * view_zenith_cos_angle));
+
+    const bool ground = false;
+    const float sample_count_ini = 40.0f; // Can go a low as 10 sample but energy lost starts to be visible.
+    const bool variable_sample_count = false;
+
+    // TEST:
+    #if 1
+    vec3 optical_depth = IntegrateOpticalDepth(world_position, world_direction, atmosphere_params.sun_direction, 
+                                               atmosphere_params, ground, 
+                                               sample_count_ini, T_RAY_MAX, variable_sample_count );
+    #else
+    const float SampleCountIni = 40.0f;
+    const float DepthBufferValue = -1.0;
+    const bool VariableSampleCount = false;
+    const bool MieRayPhase = true;
+    uint transmittance_lut = atmosphere_params.transmittance_lut_texture_index;
+    SingleScatteringResult ss = IntegrateScatteredLuminance(pos.xy, world_position, world_direction, atmosphere_params.sun_direction, atmosphere_params, ground, 
+                                    SampleCountIni, DepthBufferValue, VariableSampleCount, MieRayPhase, T_RAY_MAX,
+                                    vec2(256, 64), transmittance_lut);
+
+     vec3 optical_depth = ss.OpticalDepth;
+    #endif
+    vec3 transmittance = exp( -optical_depth );
+    //transmittance *= 0;
+    uint destination_texture = atmosphere_params.transmittance_lut_texture_index;
+    imageStore(global_images_2d[destination_texture], pos, vec4(transmittance, 1));
+}
+
+
+
+//pass transmittance_lut {
+//dispatch = 32, 32, 1
+//resources = LocalCompute
+//compute = transmittance_lut
